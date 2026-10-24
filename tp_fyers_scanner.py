@@ -150,11 +150,13 @@ def fetch_one(fy, sym, res, days, now):
             break
         msg = str(r.get("message", "")).lower()
         code = r.get("code")
-        if code in (-8, -15, -16, -17, -300) or "token" in msg or "authenticate" in msg:
-            raise TokenExpired(msg)
+        # -8/-15/-16/-17 = token expire/invalid. (-300 = invalid symbol, token ka issue nahi)
+        if code in (-8, -15, -16, -17) or "expired" in msg or "authenticate" in msg or "invalid token" in msg:
+            raise TokenExpired(f"{code} {msg}")
         if code == 429 or "limit" in msg:
             time.sleep(3)
             continue
+        print(f"  skip {sym}: code={code} {msg}")
         return None   # no_data / invalid symbol
     else:
         return None
