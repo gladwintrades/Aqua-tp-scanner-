@@ -293,6 +293,20 @@ def send_telegram(text):
 
 
 # ----------------------------------------------------------------------------
+MARKET_NOTE = "ℹ️ Abhi market band hai. Sirf Daily (1d) timeframe ke signals dikha rahe hain."
+
+
+def market_open(now):
+    """Mon-Fri, 09:15 se 15:40 tak."""
+    return now.weekday() < 5 and (9, 15) <= (now.hour, now.minute) <= (15, 40)
+
+
+def notify_token_expired(state, dry):
+    if time.time() - state.get("_token_warn", 0) > 6 * 3600 and not dry:
+        send_telegram("⚠️ Fyers access token expire ho gaya. Naya token generate karke update karein.")
+        state["_token_warn"] = time.time()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tf", nargs="+", default=DEFAULT_TF, choices=list(TF))
@@ -300,22 +314,41 @@ def main():
     ap.add_argument("--catchup", type=int, default=10, help="pichhle kitne minute ke signals dekhne hain")
     ap.add_argument("--due-window", type=int, default=8, help="candle close ke kitne min baad tak scan karna")
     ap.add_argument("--force", action="store_true", help="market hours / due check ignore karo")
-    ap.add_argument("--dry", action="store_true", help="Telegram par mat bhejo, print karo")
+    ap.add_argument("--dry", action="store_true", help="Telegram par mat bhejo, sirf print karo")
     a = ap.parse_args()
 
     now = dt.datetime.now(IST)
-    open_ = now.weekday() < 5 and (9, 10) <= (now.hour, now.minute) <= (15, 50)
-    if not open_ and not a.force:
-        print("Market band hai, skip (test ke liye --force use karo)")
+    scheduled = os.environ.get("GITHUB_EVENT_NAME") == "schedule"
+    state = load_state()
+
+    # ---- Market band: sirf Daily snapshot (manual run par), schedule par chup-chaap skip ----
+    if not market_open(now) and not a.force:
+        if scheduled:
+            print("Market band hai, skip")
+            return
+        fy = make_fyers()
+        try:
+            events = scan_tf(fy, "1d", UNIVERSE, a.lookback, a.catchup, now)
+        except TokenExpired as ex:
+            print("Fyers token expire/invalid:", ex)
+            notify_token_expired(state, a.dry)
+            save_state(state)
+            return
+        msgs = build_messages(events) or ["Koi Daily (1d) breakout signal nahi mila.\n"]
+        msgs[-1] = msgs[-1].rstrip("\n") + "\n\n" + MARKET_NOTE + "\n"
+        for m in msgs:
+            print(m)
+            if not a.dry:
+                send_telegram(m)
         return
 
+    # ---- Market chalu: due timeframes ----
     tfs = a.tf if a.force else [t for t in a.tf if is_due(t, now, a.due_window)]
     print("Scanning:", tfs or "kuch due nahi")
     if not tfs:
         return
 
     fy = make_fyers()
-    state = load_state()
     new_events = []
     try:
         for tf in tfs:
@@ -326,15 +359,15 @@ def main():
                     state[key] = time.time()
     except TokenExpired as ex:
         print("Fyers token expire/invalid:", ex)
-        if time.time() - state.get("_token_warn", 0) > 6 * 3600 and not a.dry:
-            send_telegram("⚠️ Fyers access token expire ho gaya. Naya token generate karke update karein.")
-            state["_token_warn"] = time.time()
+        notify_token_expired(state, a.dry)
         save_state(state)
         return
 
     if new_events:
         for m in build_messages(new_events):
-            print(m) if a.dry else send_telegram(m)
+            print(m)
+            if not a.dry:
+                send_telegram(m)
     else:
         print("Koi naya signal nahi")
     save_state(state)
