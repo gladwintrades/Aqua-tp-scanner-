@@ -7,14 +7,16 @@ Trigger = signal candle High/Low, SL = Aqua, Targets = Trigger +/- Gap x N).
 
 Keys CODE MEIN MAT LIKHO. Environment variables use karo:
     FYERS_CLIENT_ID      (jaise 49XXXXXXXX-100)
-    FYERS_ACCESS_TOKEN   (sirf eyJ... wala hissa)
+    FYERS_ACCESS_TOKEN   (sirf eyJ... wala hissa)  -- manual mode / fallback
+  Auto-login (roz token badalne ki zarurat nahi, ~15 din mein ek baar refresh token):
+    FYERS_SECRET_KEY, FYERS_REFRESH_TOKEN, FYERS_PIN
     TG_TOKEN, TG_CHAT_ID
 
 Install:  pip install fyers-apiv3 pandas numpy requests
 Run:      python tp_fyers_scanner.py                 # market hours mein, due timeframes
           python tp_fyers_scanner.py --dry --force   # test, Telegram nahi bhejega
 """
-import os, sys, json, math, time, argparse
+import os, sys, json, math, time, argparse, hashlib, base64
 import datetime as dt
 import numpy as np
 import pandas as pd
@@ -40,11 +42,11 @@ UNIVERSE = ("360ONE,ABB,ABCAPITAL,ADANIENSOL,ADANIENT,ADANIGREEN,ADANIPORTS,ADAN
 # tf -> (fyers resolution, history days, minutes per bar; None = daily)
 TF = {
     "1m":  ("1",   3,   1),
-    "5m":  ("5",   15,  5),
-    "15m": ("15",  40,  15),
-    "30m": ("30",  80,  30),
-    "1h":  ("60",  100, 60),
-    "1d":  ("D",   730, None),   # 2 saal (360-din ke chunks mein fetch hota hai)
+    "5m":  ("5",   12,  5),
+    "15m": ("15",  25,  15),
+    "30m": ("30",  45,  30),
+    "1h":  ("60",  70,  60),
+    "1d":  ("D",   450, None),   # ~300 daily bars (360-din ke chunks mein fetch hota hai)
 }
 DEFAULT_TF = ["5m", "15m", "30m", "1h", "1d"]   # 1m rate-limit ki wajah se default mein nahi
 
@@ -140,12 +142,78 @@ def engine(d, lb):
 # ----------------------------------------------------------------------------
 # Fyers data
 # ----------------------------------------------------------------------------
-def make_fyers():
+class RefreshFailed(Exception):
+    pass
+
+
+def jwt_days_left(token):
+    """JWT ke 'exp' se bache din (verify nahi karta, sirf padhta hai)."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload))["exp"]
+        return (exp - time.time()) / 86400
+    except Exception:
+        return None
+
+
+def refresh_access_token(cid, secret, refresh_token, pin):
+    """Refresh token + PIN se naya access token (Fyers v3 validate-refresh-token)."""
+    app_hash = hashlib.sha256(f"{cid}:{secret}".encode()).hexdigest()
+    try:
+        r = requests.post("https://api-t1.fyers.in/api/v3/validate-refresh-token",
+                          json={"grant_type": "refresh_token", "appIdHash": app_hash,
+                                "refresh_token": refresh_token, "pin": pin}, timeout=20)
+        j = r.json()
+    except Exception as e:
+        raise RefreshFailed(f"request error: {type(e).__name__}")
+    tok = j.get("access_token")
+    if j.get("s") == "ok" and tok:
+        return tok
+    # sirf code/message print hota hai, koi secret nahi
+    raise RefreshFailed(f"code={j.get('code')} msg={j.get('message')}")
+
+
+def _warn_once(state, key, text, hours, dry):
+    if not dry and time.time() - state.get(key, 0) > hours * 3600:
+        send_telegram(text)
+        state[key] = time.time()
+
+
+def make_fyers(state, dry=False):
     from fyers_apiv3 import fyersModel
     cid = os.environ.get("FYERS_CLIENT_ID")
-    tok = os.environ.get("FYERS_ACCESS_TOKEN")
-    if not cid or not tok:
-        sys.exit("FYERS_CLIENT_ID / FYERS_ACCESS_TOKEN environment variable set karo")
+    if not cid:
+        sys.exit("FYERS_CLIENT_ID set karo")
+
+    secret = os.environ.get("FYERS_SECRET_KEY")
+    rtok = os.environ.get("FYERS_REFRESH_TOKEN")
+    pin = os.environ.get("FYERS_PIN")
+    tok = None
+
+    # 1) Auto-refresh (agar teeno secrets diye hain)
+    if secret and rtok and pin:
+        try:
+            tok = refresh_access_token(cid, secret, rtok, pin)
+            print(f"::add-mask::{tok}")          # GitHub logs mein token chhupa do
+            print("Fyers access token auto-refresh OK")
+        except RefreshFailed as e:
+            print("Auto-refresh fail:", e)
+            _warn_once(state, "_refresh_warn",
+                       "⚠️ Fyers auto-login fail hua (refresh token expire ya PIN/secret galat). "
+                       "Dobara login karke FYERS_REFRESH_TOKEN update karein.", 6, dry)
+        left = jwt_days_left(rtok)
+        if left is not None and left <= 2:
+            _warn_once(state, "_refresh_expiry",
+                       f"⏰ Fyers refresh token {max(left, 0):.1f} din mein expire hoga. "
+                       "Naya login karke FYERS_REFRESH_TOKEN update kar lein.", 20, dry)
+
+    # 2) Fallback: manual access token
+    if not tok:
+        tok = os.environ.get("FYERS_ACCESS_TOKEN")
+    if not tok:
+        print("Koi valid Fyers token nahi mila")
+        return None
     return fyersModel.FyersModel(client_id=cid, token=tok, is_async=False, log_path="")
 
 
@@ -238,7 +306,7 @@ def is_due(tf, now, window):
     mins = TF[tf][2]
     t = now.hour * 60 + now.minute
     if mins is None:
-        return t >= 15 * 60 + 35
+        return 15 * 60 + 35 <= t < 15 * 60 + 40   # daily sirf ek baar (3:35-3:40)
     return (t - (9 * 60 + 15)) % mins < window
 
 
@@ -306,7 +374,8 @@ def build_messages(events):
             for e in evs:
                 lines.append(f"{e['sym']} | LTP {r05(e['close'])} | {e['since']}")
                 lines.append(f"Trig {r05(e['trig'])} | SL {r05(e['sl'])}")
-                lines.append(" | ".join(f"T{j} {r05(t)}" for j, t in enumerate(e["targets"], 1)))
+                tg = " | ".join(f"T{j} {r05(t)}" for j, t in enumerate(e["targets"], 1) if t > 0)
+                lines.append(tg if tg else "Targets: -")   # negative target ka matlab nahi, hide
                 lines.append("")
     msgs, cur = [], ""
     for ln in lines:
@@ -366,7 +435,10 @@ def main():
         if scheduled:
             print("Market band hai, skip")
             return
-        fy = make_fyers()
+        fy = make_fyers(state, a.dry)
+        if fy is None:
+            save_state(state)
+            return
         try:
             events = scan_tf(fy, "1d", UNIVERSE, a.lookback, now, a.bars, a.targets)
         except TokenExpired as ex:
@@ -388,7 +460,10 @@ def main():
     if not tfs:
         return
 
-    fy = make_fyers()
+    fy = make_fyers(state, a.dry)
+    if fy is None:
+        save_state(state)
+        return
     new_events = []
     try:
         for tf in tfs:
