@@ -1,11 +1,14 @@
-# Repo mein .github/workflows/scanner.yml naam se rakhein
 name: TrendPulse Fyers Scanner
 
 on:
   schedule:
-    # Mon-Fri, 09:15-15:50 IST ke beech har 5 minute
     - cron: "*/5 3-10 * * 1-5"
   workflow_dispatch:
+    inputs:
+      test:
+        description: "Test mode (Telegram par nahi bhejega)"
+        type: boolean
+        default: false
 
 jobs:
   scan:
@@ -33,4 +36,9 @@ jobs:
           FYERS_ACCESS_TOKEN: ${{ secrets.FYERS_ACCESS_TOKEN }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python tp_fyers_scanner.py
+        run: |
+          if [ "${{ inputs.test }}" = "true" ]; then
+            python tp_fyers_scanner.py --force --dry --tf 15m
+          else
+            python tp_fyers_scanner.py
+          fi
