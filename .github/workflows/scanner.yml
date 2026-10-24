@@ -1,0 +1,36 @@
+# Repo mein .github/workflows/scanner.yml naam se rakhein
+name: TrendPulse Fyers Scanner
+
+on:
+  schedule:
+    # Mon-Fri, 09:15-15:50 IST ke beech har 5 minute
+    - cron: "*/5 3-10 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install fyers-apiv3 pandas numpy requests
+
+      - uses: actions/cache@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Run scanner
+        env:
+          FYERS_CLIENT_ID: ${{ secrets.FYERS_CLIENT_ID }}
+          FYERS_ACCESS_TOKEN: ${{ secrets.FYERS_ACCESS_TOKEN }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python tp_fyers_scanner.py
