@@ -1,3 +1,4 @@
+# Repo mein .github/workflows/scanner.yml naam se rakhein (purani file ki jagah)
 name: TrendPulse Fyers Scanner
 
 on:
@@ -6,14 +7,33 @@ on:
   workflow_dispatch:
     inputs:
       test:
-        description: "Test mode (Telegram par nahi bhejega)"
+        description: "Test mode (market band ho tab bhi chalega)"
         type: boolean
         default: false
+      tf:
+        description: "Test ke liye timeframe"
+        type: choice
+        options:
+          - 15m
+          - 5m
+          - 30m
+          - 1h
+          - 1d
+          - 1m
+        default: 15m
+      send:
+        description: "Test result Telegram par bhi bhejo"
+        type: boolean
+        default: false
+
+concurrency:
+  group: scanner
+  cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -36,8 +56,12 @@ jobs:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
+          START=$(date +%s)
           if [ "${{ inputs.test }}" = "true" ]; then
-            python tp_fyers_scanner.py --force --dry --tf 15m
+            ARGS="--force --tf ${{ inputs.tf }}"
+            if [ "${{ inputs.send }}" != "true" ]; then ARGS="$ARGS --dry"; fi
+            python tp_fyers_scanner.py $ARGS
           else
             python tp_fyers_scanner.py
           fi
+          echo "Scan time: $(( $(date +%s) - START )) sec"
