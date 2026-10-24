@@ -40,16 +40,18 @@ UNIVERSE = ("360ONE,ABB,ABCAPITAL,ADANIENSOL,ADANIENT,ADANIGREEN,ADANIPORTS,ADAN
 # tf -> (fyers resolution, history days, minutes per bar; None = daily)
 TF = {
     "1m":  ("1",   3,   1),
-    "5m":  ("5",   10,  5),
-    "15m": ("15",  20,  15),
-    "30m": ("30",  40,  30),
+    "5m":  ("5",   15,  5),
+    "15m": ("15",  40,  15),
+    "30m": ("30",  80,  30),
     "1h":  ("60",  100, 60),
-    "1d":  ("D",   365, None),
+    "1d":  ("D",   730, None),   # 2 saal (360-din ke chunks mein fetch hota hai)
 }
 DEFAULT_TF = ["5m", "15m", "30m", "1h", "1d"]   # 1m rate-limit ki wajah se default mein nahi
 
 ATR_LEN, ATR_MULT, VWMA_LEN, MIN_BARS = 21, 6.3, 100, 130
 THROTTLE = 0.35   # Fyers limit ~200 calls/min
+BARS = 300        # Pine table ki request.security(calc_bars_count=300) jaisa; 0 = poori history (chart jaisa)
+N_TARGETS = 5     # Pine chart ke Target 1-5 jaisa
 
 
 class TokenExpired(Exception):
@@ -59,7 +61,18 @@ class TokenExpired(Exception):
 # ----------------------------------------------------------------------------
 # Indicator engine (Pine tpEngine ka port)
 # ----------------------------------------------------------------------------
+def rma(x, n):
+    """Pine ta.rma (SMA seed) - ta.atr isi se bana hai."""
+    out = np.full(len(x), np.nan)
+    if len(x) >= n:
+        out[n - 1] = np.mean(x[:n])
+        for i in range(n, len(x)):
+            out[i] = (out[i - 1] * (n - 1) + x[i]) / n
+    return out
+
+
 def engine(d, lb):
+    """Pine tpEngine ka exact port. Returns buy, sell, trig, sl, trigger-bar-index (per bar)."""
     c = d["Close"].to_numpy(float)
     h = d["High"].to_numpy(float)
     l = d["Low"].to_numpy(float)
@@ -69,15 +82,20 @@ def engine(d, lb):
     pc = np.r_[np.nan, c[:-1]]
     tr = np.maximum.reduce([h - l, np.abs(h - pc), np.abs(l - pc)])
     tr[0] = h[0] - l[0]
-    atr = pd.Series(tr).ewm(alpha=1 / ATR_LEN, adjust=False, min_periods=ATR_LEN).mean().to_numpy()
+    atr = rma(tr, ATR_LEN)
     vw = (pd.Series(c * v).rolling(VWMA_LEN).sum() / pd.Series(v).rolling(VWMA_LEN).sum()).to_numpy()
 
     ts = np.full(n, np.nan)
     pos = np.zeros(n, dtype=int)
+    buy = np.zeros(n, bool)
+    sell = np.zeros(n, bool)
+    trig = np.full(n, np.nan)
+    sl = np.full(n, np.nan)
+    tb = np.full(n, -1, dtype=int)
+
     valid = np.where(~np.isnan(atr))[0]
     if len(valid) == 0:
-        z = np.zeros(n, bool)
-        return z, z, np.full(n, np.nan), np.full(n, np.nan)
+        return buy, sell, trig, sl, tb
     start = int(valid[0])
 
     for i in range(start, n):
@@ -102,10 +120,6 @@ def engine(d, lb):
 
     aqua = (vw + ts) / 2.0
 
-    buy = np.zeros(n, bool)
-    sell = np.zeros(n, bool)
-    trig = np.full(n, np.nan)
-    sl = np.full(n, np.nan)
     bH = bA = sL = sA = np.nan
     bB = sB = -10 ** 9
 
@@ -116,11 +130,11 @@ def engine(d, lb):
             sL, sA, sB = l[i], aqua[i], i
 
         if pos[i] == 1 and not np.isnan(bH) and not np.isnan(bA) and i - bB <= lb and c[i] > bH:
-            buy[i], trig[i], sl[i] = True, bH, bA
+            buy[i], trig[i], sl[i], tb[i] = True, bH, bA, bB
         if pos[i] == -1 and not np.isnan(sL) and not np.isnan(sA) and i - sB <= lb and c[i] < sL:
-            sell[i], trig[i], sl[i] = True, sL, sA
+            sell[i], trig[i], sl[i], tb[i] = True, sL, sA, sB
 
-    return buy, sell, trig, sl
+    return buy, sell, trig, sl, tb
 
 
 # ----------------------------------------------------------------------------
@@ -135,19 +149,19 @@ def make_fyers():
     return fyersModel.FyersModel(client_id=cid, token=tok, is_async=False, log_path="")
 
 
-def fetch_one(fy, sym, res, days, now):
+def _history(fy, sym, res, d_from, d_to):
     data = {
         "symbol": f"NSE:{sym}-EQ",
         "resolution": res,
         "date_format": "1",
-        "range_from": (now - dt.timedelta(days=days)).strftime("%Y-%m-%d"),
-        "range_to": now.strftime("%Y-%m-%d"),
+        "range_from": d_from.strftime("%Y-%m-%d"),
+        "range_to": d_to.strftime("%Y-%m-%d"),
         "cont_flag": "1",
     }
     for attempt in range(3):
         r = fy.history(data=data)
         if r.get("s") == "ok":
-            break
+            return r.get("candles") or []
         msg = str(r.get("message", "")).lower()
         code = r.get("code")
         # -8/-15/-16/-17 = token expire/invalid. (-300 = invalid symbol, token ka issue nahi)
@@ -157,14 +171,33 @@ def fetch_one(fy, sym, res, days, now):
             time.sleep(3)
             continue
         print(f"  skip {sym}: code={code} {msg}")
-        return None   # no_data / invalid symbol
-    else:
         return None
+    return None
 
-    candles = r.get("candles") or []
-    if len(candles) < MIN_BARS:
+
+def fetch_one(fy, sym, res, days, now):
+    """Itihaas chunks mein laata hai (daily: 360 din, intraday: 95 din per request)."""
+    chunk = 360 if res == "D" else 95
+    end = now.date()
+    stop = end - dt.timedelta(days=days)
+    allc = []
+    first = True
+    while end > stop:
+        start = max(stop, end - dt.timedelta(days=chunk))
+        cs = _history(fy, sym, res, start, end)
+        if cs is None:
+            if first:
+                return None
+            break
+        allc = cs + allc
+        first = False
+        end = start - dt.timedelta(days=1)
+        if end > stop:
+            time.sleep(THROTTLE)
+
+    if len(allc) < MIN_BARS:
         return None
-    d = pd.DataFrame(candles, columns=["ts", "Open", "High", "Low", "Close", "Volume"])
+    d = pd.DataFrame(allc, columns=["ts", "Open", "High", "Low", "Close", "Volume"])
     d.index = pd.to_datetime(d["ts"], unit="s", utc=True).dt.tz_convert(IST)
     d = d.drop(columns="ts")
     return d[~d.index.duplicated(keep="last")].sort_index()
@@ -212,27 +245,30 @@ def is_due(tf, now, window):
 # ----------------------------------------------------------------------------
 # Scan
 # ----------------------------------------------------------------------------
-def scan_tf(fy, tf, symbols, lb, catchup, now):
+def scan_tf(fy, tf, symbols, lb, now, bars=BARS, ntar=N_TARGETS):
+    """Pine table jaisa: LAST COMPLETE candle par breakout condition sach ho to stock list mein."""
     mins = TF[tf][2]
     data = fetch(fy, symbols, tf, now)
-    nbars = 1 if mins is None else max(1, math.ceil(catchup / mins))
     events = []
     for s, d in data.items():
         d = drop_forming(d, mins, now)
+        if bars:
+            d = d.tail(bars)
         n = len(d)
         if n < MIN_BARS:
             continue
-        buy, sell, trig, sl = engine(d, lb)
+        buy, sell, trig, sl, tb = engine(d, lb)
+        k = n - 1
         for side, arr in (("BUY", buy), ("SELL", sell)):
-            fresh = arr & ~np.r_[False, arr[:-1]]   # sirf pehla breakout candle
-            for k in range(max(1, n - nbars), n):
-                if fresh[k]:
-                    gap = abs(trig[k] - sl[k])
-                    dr = 1 if side == "BUY" else -1
-                    events.append(dict(sym=s, tf=tf, side=side, ts=str(d.index[k]),
-                                       close=float(d["Close"].iloc[k]), trig=float(trig[k]),
-                                       sl=float(sl[k]), t1=float(trig[k] + dr * gap),
-                                       t2=float(trig[k] + dr * gap * 2)))
+            if arr[k]:
+                gap = abs(trig[k] - sl[k])
+                dr = 1 if side == "BUY" else -1
+                tbar = d.index[tb[k]]
+                events.append(dict(sym=s, tf=tf, side=side, ts=str(tbar),
+                                   since=tbar.strftime("%d-%b" if mins is None else "%d-%b %H:%M"),
+                                   close=float(d["Close"].iloc[k]), trig=float(trig[k]),
+                                   sl=float(sl[k]),
+                                   targets=[float(trig[k] + dr * gap * j) for j in range(1, ntar + 1)]))
     print(f"[{tf}] {len(data)} stocks scanned, {len(events)} signal(s)")
     return events
 
@@ -268,9 +304,10 @@ def build_messages(events):
                 continue
             lines.append(f"{icon} {side} BREAKOUT | {tf}")
             for e in evs:
-                lines.append(f"{e['sym']}  LTP {r05(e['close'])} | Trig {r05(e['trig'])} | "
-                             f"SL {r05(e['sl'])} | T1 {r05(e['t1'])} | T2 {r05(e['t2'])}")
-            lines.append("")
+                lines.append(f"{e['sym']} | LTP {r05(e['close'])} | {e['since']}")
+                lines.append(f"Trig {r05(e['trig'])} | SL {r05(e['sl'])}")
+                lines.append(" | ".join(f"T{j} {r05(t)}" for j, t in enumerate(e["targets"], 1)))
+                lines.append("")
     msgs, cur = [], ""
     for ln in lines:
         if len(cur) + len(ln) + 1 > 3800:
@@ -313,7 +350,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tf", nargs="+", default=DEFAULT_TF, choices=list(TF))
     ap.add_argument("--lookback", type=int, default=15, help="trigger candle kitne bars tak valid")
-    ap.add_argument("--catchup", type=int, default=10, help="pichhle kitne minute ke signals dekhne hain")
+    ap.add_argument("--bars", type=int, default=BARS, help="engine ko kitne last bars dene hain (0 = sab)")
+    ap.add_argument("--targets", type=int, default=N_TARGETS, help="kitne targets dikhane hain")
     ap.add_argument("--due-window", type=int, default=8, help="candle close ke kitne min baad tak scan karna")
     ap.add_argument("--force", action="store_true", help="market hours / due check ignore karo")
     ap.add_argument("--dry", action="store_true", help="Telegram par mat bhejo, sirf print karo")
@@ -330,7 +368,7 @@ def main():
             return
         fy = make_fyers()
         try:
-            events = scan_tf(fy, "1d", UNIVERSE, a.lookback, a.catchup, now)
+            events = scan_tf(fy, "1d", UNIVERSE, a.lookback, now, a.bars, a.targets)
         except TokenExpired as ex:
             print("Fyers token expire/invalid:", ex)
             notify_token_expired(state, a.dry)
@@ -354,7 +392,7 @@ def main():
     new_events = []
     try:
         for tf in tfs:
-            for e in scan_tf(fy, tf, UNIVERSE, a.lookback, a.catchup, now):
+            for e in scan_tf(fy, tf, UNIVERSE, a.lookback, now, a.bars, a.targets):
                 key = f"{e['sym']}|{e['tf']}|{e['side']}|{e['ts']}"
                 if key not in state:
                     new_events.append(e)
